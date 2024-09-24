@@ -32,13 +32,29 @@ DEFAULT_GEN_KWARGS = dict(
     do_sample=False,
 )
 
-def get_index(num_frames, num_segments):
-    seg_size = float(num_frames - 1) / num_segments
-    start = int(seg_size / 2)
-    offsets = np.array([
-        start + int(np.round(seg_size * idx)) for idx in range(num_segments)
+# def get_index(num_frames, num_segments):
+#     seg_size = float(num_frames - 1) / num_segments
+#     start = int(seg_size / 2)
+#     offsets = np.array([
+#         start + int(np.round(seg_size * idx)) for idx in range(num_segments)
+#     ])
+#     return offsets
+
+def get_index(fps, max_frame, num_segments, first_idx=0, bound=None):
+    if bound:
+        start, end = bound[0], bound[1]
+        if start is None:
+            start, end = -100000, 100000
+    else:
+        start, end = -100000, 100000
+    start_idx = max(first_idx, round(start * fps))
+    end_idx = min(round(end * fps), max_frame)
+    seg_size = float(end_idx - start_idx) / num_segments
+    frame_indices = np.array([
+        int(start_idx + (seg_size / 2) + np.round(seg_size * idx))
+        for idx in range(num_segments)
     ])
-    return offsets
+    return frame_indices
 
 def load_image(image_path, resolution=224, hd_num=6):
     image = Image.open(image_path).convert("RGB")
@@ -66,11 +82,7 @@ def load_image(image_path, resolution=224, hd_num=6):
     image_tensor = torch.cat([sub_img, glb_img])#.unsqueeze(0)
     return image_tensor
 
-def load_video(video_path, num_segments=16, return_msg=False, resolution=224, hd_num=6, padding=False):
-    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
-    num_frames = len(vr)
-    frame_indices = get_index(num_frames, num_segments)
-
+def load_video(video_path, num_segments=16, return_msg=False, resolution=224, hd_num=6, padding=False, start=None, end=None):
     mean = (0.485, 0.456, 0.406)
     std = (0.229, 0.224, 0.225)
 
@@ -79,8 +91,20 @@ def load_video(video_path, num_segments=16, return_msg=False, resolution=224, hd
         T.Normalize(mean, std)
     ])
 
-    frames = vr.get_batch(frame_indices)
-    frames = frames.permute(0, 3, 1, 2)
+    if isinstance(video_path, list):
+        to_tensor = T.ToTensor()
+        frames = []
+        frame_indices = get_index(fps=3, max_frame=len(video_path), num_segments=num_segments)
+        for index in frame_indices:
+            frames.append(to_tensor(video_path[index]).unsqueeze(0))
+        frames = torch.cat(frames, dim=0)
+    else:
+        vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+        max_frame = len(vr) -1
+        fps = float(vr.get_avg_fps())
+        frame_indices = get_index(fps=fps, max_frame=max_frame, num_segments=num_segments, bound=[start, end])
+        frames = vr.get_batch(frame_indices)
+        frames = frames.permute(0, 3, 1, 2)
 
     if padding:
         frames = HD_transform_padding(frames.float(), image_size=resolution, hd_num=hd_num)
@@ -209,12 +233,13 @@ class InternVideo2(lmms):
         device: str = "cuda:0",
         device_map: str = "cuda:0",
         batch_size: str = "1",
-        num_segments: str = "16",
+        num_segments: str = "8",
         hd_num: str = "6",
         **kwargs,
     ):
         super().__init__()
         self.path = pretrained
+        self.instruction = "Carefully watch the video and pay attention to the cause and sequence of events, the detail and movement of objects, and the action and pose of persons.\n"
         self._tokenizer =  AutoTokenizer.from_pretrained(self.path,
                         trust_remote_code=True,
                         use_fast=False)
@@ -340,18 +365,21 @@ class InternVideo2(lmms):
                 pixel_values = load_image(image_path, resolution=224, hd_num=self.hd_num)
                 pixel_values = pixel_values.to(torch.bfloat16).cuda()
                 question = contexts
-                response, history = self.model.chat(self.tokenizer, msg="", user_prompt=question, media_type="image", media_tensor = pixel_values, instruction=None, chat_history=[], return_history=True, **gen_kwargs)
-            elif self.modality == "video":
-                assert len(visuals) == 1, f"Only one video is supported, but got {len(visuals)} videos. [META-INFO]{visuals}"
-                video_path = visuals[0]
+                response, history = self.model.chat(self.tokenizer, msg="", user_prompt=question, media_type="image", media_tensor = pixel_values, instruction=self.instruction, chat_history=[], return_history=True, **gen_kwargs)
+            elif self.modality == "video":    
                 if "mvbench" in task:
                     answer_prompt="Best Option:("
+                    self.instruction = "Carefully watch the video and pay attention to the cause and sequence of events, the detail and movement of objects, and the action and pose of persons. Based on your observations, select the best option that accurately addresses the question.\n"
+                    assert len(visuals) == 3, f"Only one video is supported, but got {len(visuals)} videos. [META-INFO]{visuals}"
+                    video_path, start, end = visuals
                 else:
+                    assert len(visuals) == 1, f"Only one video is supported, but got {len(visuals)} videos. [META-INFO]{visuals}"
                     answer_prompt= None
-                pixel_values = load_video(video_path, num_segments=self.num_segments, return_msg=False, resolution=224, hd_num=self.hd_num)
+                    video_path = visuals[0]
+                pixel_values = load_video(video_path, num_segments=self.num_segments, return_msg=False, resolution=224, hd_num=self.hd_num, start=start, end = end)
                 pixel_values = pixel_values.to(torch.bfloat16).cuda()
-                question = contexts
-                response, history = self.model.chat(self.tokenizer, msg="", user_prompt=question, media_type="video", media_tensor = pixel_values, instruction=None, chat_history=[], return_history=True, generation_config = gen_kwargs, answer_prompt=answer_prompt)
+                question = self.instruction + contexts
+                response, history = self.model.chat(self.tokenizer, msg="", user_prompt=question, media_type="video", media_tensor = pixel_values, instruction=self.instruction, chat_history=[], return_history=True, generation_config = gen_kwargs, answer_prompt=answer_prompt, debug_conv=False)
             res.append(response)
             pbar.update(1)
         pbar.close()
