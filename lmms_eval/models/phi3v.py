@@ -1,8 +1,12 @@
 from typing import List, Optional, Tuple, Union
 
+import decord
+import numpy as np
 import torch
 from accelerate import Accelerator, DistributedType
+from decord import VideoReader, cpu
 from loguru import logger as eval_logger
+from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor
 
@@ -10,6 +14,53 @@ from lmms_eval import utils
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
+
+
+def get_index(max_frame, num_segments, fps, first_idx=0, bound=None):
+    if bound:
+        start, end = bound[0], bound[1]
+        if start is None:
+            start, end = -100000, 100000
+    else:
+        start, end = -100000, 100000
+    start_idx = max(first_idx, round(start * fps))
+    end_idx = min(round(end * fps), max_frame)
+    seg_size = float(end_idx - start_idx) / num_segments
+    frame_indices = np.array([int(start_idx + (seg_size / 2) + np.round(seg_size * idx)) for idx in range(num_segments)])
+    return frame_indices
+
+
+def load_video(video_path, num_segments=16, return_msg=False, resolution=224, hd_num=6, padding=False):
+    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+    num_frames = len(vr) - 1
+
+    frame_indices = get_index(max_frame=num_frames, num_segments=num_segments, fps=float(vr.get_avg_fps()), first_idx=0, bound=None)
+
+    frames = vr.get_batch(frame_indices).asnumpy()
+
+    pil_images = []
+    for frame in frames:
+        frame = Image.fromarray(frame)
+        pil_images.append(frame)
+
+    return pil_images
+    # frames = frames.permute(0, 3, 1, 2)
+
+    # if padding:
+    #     frames = HD_transform_padding(frames.float(), image_size=resolution, hd_num=hd_num)
+    # else:
+    #     frames = HD_transform_no_padding(frames.float(), image_size=resolution, hd_num=hd_num)
+
+    # frames = transform(frames).unsqueeze(0)
+
+    # if return_msg:
+    #     fps = float(vr.get_avg_fps())
+    #     sec = ", ".join([str(round(f / fps, 1)) for f in frame_indices])
+    #     # " " should be added in the start and end
+    #     msg = f"The video contains {len(frame_indices)} frames sampled at {sec} seconds."
+    #     return frames, msg
+    # else:
+    #     return frames
 
 
 @register_model("phi3v")
@@ -151,7 +202,12 @@ class Phi3v(lmms):
             task = task[0]
             split = split[0]
             visuals = [doc_to_visual[0](self.task_dict[task][split][ids]) for ids in doc_id]
+
             visuals = self.flatten(visuals)
+
+            # For video
+            visuals = load_video(visuals[0], num_segments=8)
+
             # We assume all gen kwargs in the batch are the same
             # this is safe to assume because the `grouper` object ensures it.
             gen_kwargs = all_gen_kwargs[0]
@@ -182,11 +238,14 @@ class Phi3v(lmms):
                 contexts[i] = self._tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             assert len(contexts) == 1
             #
-            context = contexts[0]
+            context = contexts[0] + "Best Option is: ("
+            # print(visuals, context)
+            # import ipdb
+            # ipdb.set_trace()
             input_ids = self._processor(text=context, images=visuals, return_tensors="pt").to(self._device, self.model.dtype)
             # Setting default parameters.
             if "max_new_tokens" not in gen_kwargs:
-                gen_kwargs["max_new_tokens"] = 1024
+                gen_kwargs["max_new_tokens"] = 2048
             if "temperature" not in gen_kwargs:
                 gen_kwargs["temperature"] = 0
             if "top_p" not in gen_kwargs:
@@ -209,6 +268,7 @@ class Phi3v(lmms):
             generate_ids = generate_ids[:, input_ids["input_ids"].shape[1] :]
             response = self._processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
             res.append(response)
+            print(response)
             self.cache_hook.add_partial("generate_until", (context, gen_kwargs), response)
             pbar.update(1)
         # reorder this group of results back to original unsorted form
